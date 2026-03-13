@@ -69,6 +69,31 @@ function touchRoom(code) {
   if (rooms[code]) rooms[code].lastActivity = Date.now();
 }
 
+function removeClientFromRoom(ws, notifyPeer = true) {
+  const code = ws.roomCode;
+  if (!code || !rooms[code]) {
+    ws.roomCode = null;
+    return;
+  }
+
+  rooms[code].clients = rooms[code].clients.filter((c) => c !== ws);
+  touchRoom(code);
+
+  if (notifyPeer) {
+    rooms[code].clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'peer-disconnected' }));
+      }
+    });
+  }
+
+  if (rooms[code].clients.length === 0) {
+    delete rooms[code];
+  }
+
+  ws.roomCode = null;
+}
+
 // ── Room cleanup (every 5 min) ──────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
@@ -140,6 +165,7 @@ wss.on('connection', (ws, req) => {
 
     switch (type) {
       case 'create': {
+        removeClientFromRoom(ws, true);
         const code = generateCode();
         const token = encodeRoomToken(code);
         rooms[code] = {
@@ -169,12 +195,25 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
+        if (ws.roomCode === code) {
+          ws.send(JSON.stringify({ type: 'joined', payload: { code } }));
+          return;
+        }
+
+        removeClientFromRoom(ws, true);
+
         rooms[code].clients.push(ws);
         ws.roomCode = code;
         touchRoom(code);
         ws.send(JSON.stringify({ type: 'joined', payload: { code } }));
         // Notify the sender that a peer joined
         rooms[code].clients[0].send(JSON.stringify({ type: 'peer-joined' }));
+        break;
+      }
+
+      case 'leave': {
+        removeClientFromRoom(ws, true);
+        ws.send(JSON.stringify({ type: 'left' }));
         break;
       }
 
@@ -195,15 +234,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    const code = ws.roomCode;
-    if (code && rooms[code]) {
-      rooms[code].clients = rooms[code].clients.filter((c) => c !== ws);
-      rooms[code].clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN)
-          client.send(JSON.stringify({ type: 'peer-disconnected' }));
-      });
-      if (rooms[code].clients.length === 0) delete rooms[code];
-    }
+    removeClientFromRoom(ws, true);
   });
 });
 
