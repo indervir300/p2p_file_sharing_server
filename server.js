@@ -5,21 +5,20 @@ const crypto = require('crypto');
 
 // ── Config ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
-const ROOM_TTL_MS = 30 * 60 * 1000;           // 30 min room expiry
-const RATE_LIMIT_WINDOW = 60 * 1000;           // 1 min
-const RATE_LIMIT_MAX = 15;                      // max connections per IP per window
+const ROOM_TTL_MS = 30 * 60 * 1000;
+const RATE_LIMIT_WINDOW = 60 * 1000;
+const RATE_LIMIT_MAX = 15;
 const TOKEN_SECRET = process.env.TOKEN_SECRET || 'p2p-fileshare-default-secret-key';
 
 // ── State ───────────────────────────────────────────────────────────────
-const rooms = {};          // { code: { clients: [ws], createdAt, lastActivity } }
-const ipHits = new Map();  // rate-limit tracker
+const rooms = {};
+const ipHits = new Map();
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 function generateCode() {
-  return crypto.randomBytes(3).toString('hex').toUpperCase(); // 6-char hex
+  return crypto.randomBytes(3).toString('hex').toUpperCase();
 }
 
-/** Encode room code into a URL-safe token */
 function encodeRoomToken(code) {
   const cipher = crypto.createCipheriv(
     'aes-128-ecb',
@@ -31,7 +30,6 @@ function encodeRoomToken(code) {
   return encrypted;
 }
 
-/** Decode a room token back to a room code */
 function decodeRoomToken(token) {
   try {
     const decipher = crypto.createDecipheriv(
@@ -109,9 +107,8 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ── HTTP server (health check + upgrade) ────────────────────────────────
+// ── HTTP server ──────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  // CORS headers for all HTTP requests
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -130,7 +127,6 @@ const server = http.createServer((req, res) => {
     }));
   }
 
-  // Decode-token endpoint (for debugging / verification)
   if (req.url?.startsWith('/decode?token=')) {
     const token = new URL(req.url, `http://${req.headers.host}`).searchParams.get('token');
     const code = decodeRoomToken(token);
@@ -170,6 +166,7 @@ wss.on('connection', (ws, req) => {
         const token = encodeRoomToken(code);
         rooms[code] = {
           clients: [ws],
+          creator: ws,              // ← fixed: store creator reference
           createdAt: Date.now(),
           lastActivity: Date.now(),
         };
@@ -179,7 +176,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'join': {
-        // Support joining by code or by token
         let code = payload.code?.toUpperCase();
         if (payload.token) {
           const decoded = decodeRoomToken(payload.token);
@@ -201,13 +197,15 @@ wss.on('connection', (ws, req) => {
         }
 
         removeClientFromRoom(ws, true);
-
         rooms[code].clients.push(ws);
         ws.roomCode = code;
         touchRoom(code);
         ws.send(JSON.stringify({ type: 'joined', payload: { code } }));
-        // Notify the sender that a peer joined
-        rooms[code].clients[0].send(JSON.stringify({ type: 'peer-joined' }));
+
+        // ← fixed: use stored creator ref instead of clients[0]
+        if (rooms[code].creator?.readyState === WebSocket.OPEN) {
+          rooms[code].creator.send(JSON.stringify({ type: 'peer-joined' }));
+        }
         break;
       }
 
@@ -230,6 +228,19 @@ wss.on('connection', (ws, req) => {
         });
         break;
       }
+
+      // ← NEW: pure WebSocket relay for file/chat when WebRTC ICE fails
+      case 'relay': {
+        const code = ws.roomCode;
+        if (!rooms[code]) return;
+        touchRoom(code);
+        rooms[code].clients.forEach((client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'relay', payload }));
+          }
+        });
+        break;
+      }
     }
   });
 
@@ -238,7 +249,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ── Heartbeat (detect dead connections) ─────────────────────────────────
+// ── Heartbeat ─────────────────────────────────────────────────────────
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
