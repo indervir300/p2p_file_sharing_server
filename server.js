@@ -6,8 +6,6 @@ const crypto = require('crypto');
 // ── Config ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
 const ROOM_TTL_MS = 30 * 60 * 1000;
-const RATE_LIMIT_WINDOW = 60 * 1000;
-const RATE_LIMIT_MAX = 15;
 const TOKEN_SECRET = process.env.TOKEN_SECRET || 'p2p-fileshare-default-secret-key';
 
 // ── State ───────────────────────────────────────────────────────────────
@@ -52,16 +50,6 @@ function getClientIp(req) {
     req.socket.remoteAddress ||
     'unknown'
   );
-}
-
-function isRateLimited(ip) {
-  const now = Date.now();
-  if (!ipHits.has(ip)) ipHits.set(ip, []);
-  const hits = ipHits.get(ip).filter((t) => t > now - RATE_LIMIT_WINDOW);
-  ipHits.set(ip, hits);
-  if (hits.length >= RATE_LIMIT_MAX) return true;
-  hits.push(now);
-  return false;
 }
 
 function touchRoom(code) {
@@ -168,12 +156,6 @@ wss.on('connection', (ws, req) => {
 
   ws.roomCode = null;
   ws.isAlive = true;
-
-  if (isRateLimited(ip)) {
-    ws.send(JSON.stringify({ type: 'error', payload: { message: 'Rate limited. Try again later.' } }));
-    ws.close();
-    return;
-  }
 
   ws.on('pong', () => { ws.isAlive = true; });
 
