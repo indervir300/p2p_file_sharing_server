@@ -12,6 +12,7 @@ const TOKEN_SECRET = process.env.TOKEN_SECRET || 'p2p-fileshare-default-secret-k
 
 // ── State ───────────────────────────────────────────────────────────────
 const rooms = {};
+const lobby = new Map(); // id -> ws
 const ipHits = new Map();
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -67,6 +68,22 @@ function touchRoom(code) {
   if (rooms[code]) rooms[code].lastActivity = Date.now();
 }
 
+function broadcastLobby() {
+  const peers = [];
+  lobby.forEach((client, id) => {
+    peers.push({ id: id, nickname: client.nickname });
+  });
+
+  console.log(`[LOBBY] Broadcasting to ${lobby.size} users. Peers:`, peers);
+
+  const msg = JSON.stringify({ type: 'lobby-update', payload: { peers } });
+  lobby.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  });
+}
+
 function removeClientFromRoom(ws, notifyPeer = true) {
   const code = ws.roomCode;
   if (!code || !rooms[code]) {
@@ -90,6 +107,8 @@ function removeClientFromRoom(ws, notifyPeer = true) {
   }
 
   ws.roomCode = null;
+  // IMPORTANT: We don't automatically put them back in lobby here; 
+  // the client will send 'identify' again if they want to be visible.
 }
 
 // ── Room cleanup (every 5 min) ──────────────────────────────────────────
@@ -143,14 +162,18 @@ const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
   const ip = getClientIp(req);
+  const hubId = crypto.randomBytes(4).toString('hex');
+  ws.hubId = hubId;
+  ws.nickname = 'Guest';
+
+  ws.roomCode = null;
+  ws.isAlive = true;
+
   if (isRateLimited(ip)) {
     ws.send(JSON.stringify({ type: 'error', payload: { message: 'Rate limited. Try again later.' } }));
     ws.close();
     return;
   }
-
-  ws.roomCode = null;
-  ws.isAlive = true;
 
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -166,12 +189,68 @@ wss.on('connection', (ws, req) => {
         const token = encodeRoomToken(code);
         rooms[code] = {
           clients: [ws],
-          creator: ws,              // ← fixed: store creator reference
+          creator: ws,
           createdAt: Date.now(),
           lastActivity: Date.now(),
         };
         ws.roomCode = code;
+        lobby.delete(ws.hubId); // Remove from lobby when in room
+        broadcastLobby();
         ws.send(JSON.stringify({ type: 'created', payload: { code, token } }));
+        break;
+      }
+
+      case 'identify': {
+        const { nickname } = payload;
+        ws.nickname = nickname || 'Guest';
+        console.log(`[LOBBY] User identified: ${ws.nickname} (${ws.hubId})`);
+        
+        if (!ws.roomCode) {
+          lobby.set(ws.hubId, ws);
+        }
+        ws.send(JSON.stringify({ type: 'identified', payload: { hubId: ws.hubId } }));
+        broadcastLobby();
+        break;
+      }
+
+      case 'invite': {
+        const { targetId, roomCode } = payload;
+        const target = lobby.get(targetId);
+        if (target && target.readyState === WebSocket.OPEN) {
+          // Store the inviter's hubId on the target so they can reply directly
+          target.send(JSON.stringify({
+            type: 'invited',
+            payload: { fromId: ws.hubId, fromNick: ws.nickname, roomCode }
+          }));
+        }
+        break;
+      }
+
+      case 'invite-reject': {
+        const { targetId } = payload;
+        // targetId here is the original inviter
+        const target = Array.from(wss.clients).find(c => c.hubId === targetId);
+        if (target && target.readyState === WebSocket.OPEN) {
+          target.send(JSON.stringify({
+            type: 'invite-rejected',
+            payload: { fromNick: ws.nickname }
+          }));
+        }
+        break;
+      }
+
+      case 'invite-cancel': {
+        const { targetId } = payload;
+        // targetId here is the invitee
+        const target = lobby.get(targetId);
+        if (target && target.readyState === WebSocket.OPEN) {
+          target.send(JSON.stringify({
+            type: 'invite-cancelled',
+            payload: { fromId: ws.hubId }
+          }));
+        }
+        // Cleanup the room since the inviter cancelled
+        removeClientFromRoom(ws, false);
         break;
       }
 
@@ -199,6 +278,8 @@ wss.on('connection', (ws, req) => {
         removeClientFromRoom(ws, true);
         rooms[code].clients.push(ws);
         ws.roomCode = code;
+        lobby.delete(ws.hubId); // Remove from lobby when in room
+        broadcastLobby();
         touchRoom(code);
         ws.send(JSON.stringify({ type: 'joined', payload: { code } }));
 
@@ -211,7 +292,12 @@ wss.on('connection', (ws, req) => {
 
       case 'leave': {
         removeClientFromRoom(ws, true);
+        // Put back in lobby if they were identified
+        if (ws.nickname) {
+           lobby.set(ws.hubId, ws);
+        }
         ws.send(JSON.stringify({ type: 'left' }));
+        broadcastLobby();
         break;
       }
 
@@ -246,17 +332,24 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     removeClientFromRoom(ws, true);
+    lobby.delete(ws.hubId);
+    broadcastLobby();
   });
 });
 
 // ── Heartbeat ─────────────────────────────────────────────────────────
 setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
+    if (!ws.isAlive) {
+      removeClientFromRoom(ws, true);
+      lobby.delete(ws.hubId);
+      broadcastLobby();
+      return ws.terminate();
+    }
     ws.isAlive = false;
     ws.ping();
   });
-}, 30_000);
+}, 10_000);
 
 // ── Start ───────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
